@@ -1,0 +1,38 @@
+# Stream-DiffVSR - Mac/Apple Silicon (MPS) Requirements
+# Optimized for M1/M2/M3/M4 chips with Metal Performance Shaders
+#
+# Install with: pip install -r requirements-mac.txt
+
+# Core ML Framework
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Diffusion Framework
+diffusers>=0.27.2
+transformers>=4.37.2
+accelerate>=0.23.0
+safetensors>=0.4.5
+
+# Image Processing
+pillow>=10.4.0
+opencv-python>=4.10.0.84
+imageio>=2.36.1
+scikit-image>=0.24.0
+
+# Numerical Computing
+numpy>=1.26.4
+scipy>=1.13.1
+
+# Hugging Face
+huggingface-hub>=0.24.6
+tokenizers>=0.15.2
+
+# Utilities
+tqdm>=4.65.2
+pyyaml>=6.0.2
+einops>=0.8.0
+omegaconf>=2.3.0
+
+# Optional: For better performance monitoring
+psutil>=6.1.0
