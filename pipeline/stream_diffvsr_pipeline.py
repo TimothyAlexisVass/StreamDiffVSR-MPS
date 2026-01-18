@@ -20,7 +20,6 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
-import torchvision.transforms as T
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
@@ -702,15 +701,17 @@ class StreamDiffVSRPipeline(
         latents = latents * self.scheduler.init_noise_sigma
         return latents
     
-    def compute_flows(self, of_model, images, rescale_factor=1):
-        print('Computing forward flows...')
-        forward_flows = []
-        for i in range(1, len(images)):
-            prev_image = images[i - 1]
-            cur_image = images[i]
-            fflow = of.get_flow(of_model, cur_image, prev_image, rescale_factor=rescale_factor)
-            forward_flows.append(fflow)
-        return forward_flows
+    def compute_single_flow(self, of_model, cur_image, prev_image, rescale_factor=1):
+        """Compute optical flow between two frames and upscale it for HR processing."""
+        flow_lr = of.get_flow(of_model, cur_image, prev_image, rescale_factor=rescale_factor)
+        # Upscale flow spatially by 4x and multiply values by 4
+        flow_hr = F.interpolate(
+            flow_lr.permute(0, 3, 1, 2),  # (B, 2, H, W)
+            scale_factor=4,
+            mode='bilinear',
+            align_corners=False
+        ).permute(0, 2, 3, 1) * 4  # (B, H*4, W*4, 2)
+        return flow_hr
         
 
     @torch.no_grad()
@@ -893,34 +894,19 @@ class StreamDiffVSRPipeline(
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-        # 4. Prepare image
-        if isinstance(controlnet, ControlNetModel):
-            images =  [self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32).to(device) for image in images]
-            upscaled_images = [F.interpolate(image, scale_factor=4, mode='bicubic') for image in images]
-            height, width = upscaled_images[0].shape[-2:]
-        elif isinstance(controlnet, MultiControlNetModel):
-            images = []
-
-            for image_ in image:
-                image_ = self.prepare_image(
-                    image=image_,
-                    width=width,
-                    height=height,
-                    batch_size=batch_size * num_images_per_prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    device=device,
-                    dtype=controlnet.dtype,
-                    do_classifier_free_guidance=do_classifier_free_guidance,
-                    guess_mode=guess_mode,
-                )
-
-                images.append(image_)
-
-            image = images
-            height, width = image[0].shape[-2:]
-        else:
-            assert False
-
+        # 4. Prepare for streaming frame processing
+        # We process frames one at a time to minimize memory usage
+        # Only keep: current frame tensor, previous frame output, current flow
+        
+        if not isinstance(controlnet, ControlNetModel):
+            raise ValueError("Streaming mode only supports single ControlNetModel")
+        
+        # Get output dimensions from first frame (preprocess temporarily just to get size)
+        first_image = self.control_image_processor.preprocess(images[0], height=height, width=width).to(dtype=torch.float32).to(device)
+        input_height, input_width = first_image.shape[-2:]
+        height, width = input_height * 4, input_width * 4  # Output dimensions (4x upscale)
+        del first_image  # Free memory
+        
         # 5. Prepare timesteps
         if timesteps_to_be_used is None:
             self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -928,21 +914,10 @@ class StreamDiffVSRPipeline(
             self.scheduler.set_timesteps(timesteps=timesteps_to_be_used, device=device)
         timesteps = self.scheduler.timesteps
 
-        # 6. Prepare latent variables
+        # 6. Prepare single latent (reused for each frame)
         num_channels_latents = self.vae.config.latent_channels
-        latents = [self.prepare_latents(
-                    batch_size * num_images_per_prompt,
-                    num_channels_latents,
-                    height,
-                    width,
-                    prompt_embeds.dtype,
-                    device,
-                    generator
-                ) for _ in range(len(images))]
-        # latents = self.scheduler.add_noise(image, )
         
-        noise_level = torch.cat([torch.tensor([20], dtype=torch.long, device=device)])
-        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 7. Prepare extra step kwargs
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 7.1 Create tensor stating which controlnets to keep
@@ -954,51 +929,65 @@ class StreamDiffVSRPipeline(
             ]
             controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
 
-        # 8. Denoising loop
-        # Compute optical flow on LR images (pre-upscale) to avoid OOM, then scale the flow
-        # The flow needs to be: 1) spatially upscaled by 4x, 2) values multiplied by 4x
-        forward_flows_lr = self.compute_flows(of_model, images, rescale_factor=of_rescale_factor)
-        forward_flows = []
-        for flow_lr in forward_flows_lr:
-            # flow_lr shape: (B, H, W, 2) - upscale spatially and multiply values by 4
-            flow_hr = F.interpolate(
-                flow_lr.permute(0, 3, 1, 2),  # (B, 2, H, W)
-                scale_factor=4,
-                mode='bilinear',
-                align_corners=False
-            ).permute(0, 2, 3, 1) * 4  # (B, H*4, W*4, 2), values scaled by 4
-            forward_flows.append(flow_hr)
-        flows = forward_flows
+        # 8. Streaming frame processing
+        # Only keep in memory: previous frame's LR tensor (for flow), previous RGB output (for warping)
         interp_mode = 'bilinear' if of_rescale_factor == 1 else 'nearest'
-
+        
         self.vae.reset_temporal_condition()
-
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        with self.progress_bar(total=len(timesteps)*len(images)) as progress_bar:
-            # reversed = False
-            # for t, for image --> frame wise sampling
-            for num_image, data in enumerate(images):
-                image = data
+        
+        # Store only final PIL outputs (small memory footprint)
+        output_images = []
+        prev_frame_lr = None  # Previous frame's LR tensor (for optical flow)
+        rgb_for_warpping_to_next_frame = None  # Previous frame's HR output (for warping)
+        num_frames = len(images)
+        
+        with self.progress_bar(total=len(timesteps)*num_frames) as progress_bar:
+            for num_image in range(num_frames):
+                # Preprocess current frame on-demand
+                current_frame_lr = self.control_image_processor.preprocess(
+                    images[num_image], height=input_height, width=input_width
+                ).to(dtype=torch.float32).to(device)
+                image_tensor = current_frame_lr  # LR image for conditioning
+                
+                # Prepare fresh latent for this frame
+                latent = self.prepare_latents(
+                    batch_size * num_images_per_prompt,
+                    num_channels_latents,
+                    height,
+                    width,
+                    prompt_embeds.dtype,
+                    device,
+                    generator
+                )
 
                 dec_temporal_features = None
-                # compute Temporal Texture Guidance
-                if num_image != 0: # if it's not the first image
-                    # rgb_for_warpping_to_next_frame = (rgb_for_warpping_to_next_frame + 1) / 2
-                    warped_prev_est = of.flow_warp(rgb_for_warpping_to_next_frame, flows[num_image - 1], interp_mode=interp_mode) # warp it to current frame
-                    enc_layer_features = self.vae.encode(warped_prev_est, return_features_only=True) # encode the warped image
+                current_flow = None
+                warped_prev_est = None
+                
+                # Compute optical flow and temporal features (except for first frame)
+                if num_image != 0 and prev_frame_lr is not None:
+                    # Compute flow just-in-time between previous and current LR frames
+                    current_flow = self.compute_single_flow(
+                        of_model, current_frame_lr, prev_frame_lr, rescale_factor=of_rescale_factor
+                    )
+                    # Warp previous output to current frame
+                    warped_prev_est = of.flow_warp(
+                        rgb_for_warpping_to_next_frame, current_flow, interp_mode=interp_mode
+                    )
+                    enc_layer_features = self.vae.encode(warped_prev_est, return_features_only=True)
                     dec_temporal_features = enc_layer_features[::-1]
                 
+                # Denoising loop for current frame
                 for i, t in enumerate(timesteps):
-                        
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents[num_image]] * 2) if do_classifier_free_guidance else latents[num_image]
+                    # Expand latents for classifier free guidance
+                    latent_model_input = torch.cat([latent] * 2) if do_classifier_free_guidance else latent
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                    latent_model_input = torch.cat([latent_model_input, image], dim=1)
+                    latent_model_input = torch.cat([latent_model_input, image_tensor], dim=1)
 
-                    # controlnet(s) inference
+                    # ControlNet inference
                     if guess_mode and do_classifier_free_guidance:
-                        # Infer ControlNet only for the conditional batch.
-                        control_model_input = latents
+                        control_model_input = latent
                         control_model_input = self.scheduler.scale_model_input(control_model_input, t)
                         controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
                     else:
@@ -1013,74 +1002,94 @@ class StreamDiffVSRPipeline(
                             controlnet_cond_scale = controlnet_cond_scale[0]
                         cond_scale = controlnet_cond_scale * controlnet_keep[i]
 
-                    if num_image == 0: 
-                        # predict without Temporal Conditioning Module
+                    if num_image == 0:
+                        # First frame: no temporal conditioning
                         down_block_res_samples = None
                         mid_block_res_sample = None
                     else:
-                        # predict with Temporal Conditioning Module
+                        # Subsequent frames: use temporal conditioning
                         down_block_res_samples, mid_block_res_sample = self.controlnet(
                             control_model_input,
                             t,
                             encoder_hidden_states=controlnet_prompt_embeds,
                             controlnet_cond=warped_prev_est,
                             conditioning_scale=cond_scale,
-                            # class_labels = noise_level,
                             guess_mode=guess_mode,
                             return_dict=False,
                             timestep_cond=None
                         )
                         if guess_mode and do_classifier_free_guidance:
-                            # Infered ControlNet only for the conditional batch.
-                            # To apply the output of ControlNet to both the unconditional and conditional batches,
-                            # add 0 to the unconditional batch to keep it unchanged.
                             down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                             mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
                     
-                    # predict the noise residual
+                    # Predict noise residual
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
                         encoder_hidden_states=prompt_embeds,
-                        # class_labels = noise_level,
                         cross_attention_kwargs=cross_attention_kwargs,
                         down_block_additional_residuals=down_block_res_samples,
                         mid_block_additional_residual=mid_block_res_sample,
                         return_dict=False,
                     )[0]
 
-                    # perform guidance
+                    # Perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    output = self.scheduler.step(noise_pred, t, latents[num_image], **extra_step_kwargs)
-                    latents[num_image], x0_est = output.prev_sample, output.pred_original_sample # x_t-1, x0_est
+                    # Compute previous noisy sample x_t -> x_t-1
+                    output = self.scheduler.step(noise_pred, t, latent, **extra_step_kwargs)
+                    latent, x0_est = output.prev_sample, output.pred_original_sample
 
-                    # call the callback, if provided
+                    # Update progress
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latents)
-                            
+                            callback(i, t, latent)
+                
+                # Decode latent to RGB
                 if not output_type == "latent":
-                    image = self.vae.decode(latents[num_image] / self.vae.config.scaling_factor, temporal_features = dec_temporal_features, return_dict=False)[0]# convert latent[num_image] to RGB
+                    decoded_image = self.vae.decode(
+                        latent / self.vae.config.scaling_factor, 
+                        temporal_features=dec_temporal_features, 
+                        return_dict=False
+                    )[0]
                 else:
-                    image = latents
-                    has_nsfw_concept = None
+                    decoded_image = latent
 
-                rgb_for_warpping_to_next_frame = image 
+                # Store HR output for next frame's warping (keep on GPU)
+                rgb_for_warpping_to_next_frame = decoded_image.clone()
 
+                # Postprocess to PIL and store
                 has_nsfw_concept = None
-                if has_nsfw_concept is None:
-                    do_denormalize = [True] * image[0].shape[0]
-                else:
-                    do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-                image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
-                images[num_image] = image
+                do_denormalize = [True] * decoded_image[0].shape[0]
+                pil_image = self.image_processor.postprocess(
+                    decoded_image, output_type=output_type, do_denormalize=do_denormalize
+                )
+                output_images.append(pil_image)
 
+                # Update previous frame LR for next iteration's optical flow
+                prev_frame_lr = current_frame_lr
+                
+                # Clear intermediate tensors
+                del latent, decoded_image, current_flow, warped_prev_est, dec_temporal_features
+                del image_tensor
+                
                 self.vae.reset_temporal_condition()
+                
+                # Clear memory cache periodically
+                if num_image % 10 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+        
+        # Final cleanup
+        del prev_frame_lr, rgb_for_warpping_to_next_frame
+        
+        # Replace images list with output PIL images
+        images = output_images
 
         # If we do sequential model offloading, let's offload unet and controlnet
         # manually for max memory savings
