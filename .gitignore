@@ -4,6 +4,8 @@
 /output/*
 !/output/.gitkeep
 
+tmp/
+
 # Python
 __pycache__/
 *.pyc

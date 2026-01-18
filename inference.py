@@ -2,6 +2,8 @@ import os
 import sys
 import argparse
 import time
+import subprocess
+import shutil
 from pathlib import Path
 import torch
 from accelerate.utils import set_seed
@@ -15,22 +17,13 @@ from pipeline.stream_diffvsr_pipeline import StreamDiffVSRPipeline, ControlNetMo
 from diffusers import DDIMScheduler
 from temporal_autoencoder.autoencoder_tiny import TemporalAutoencoderTiny
 
-
-def get_device():
-    """
-    Detect and return the best available device.
-    Priority: CUDA > MPS > CPU
-    """
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    elif torch.backends.mps.is_available():
-        # Check if MPS is actually usable (not just available)
-        try:
-            torch.zeros(1).to('mps')
-            return torch.device('mps')
-        except Exception:
-            pass
-    return torch.device('cpu')
+# Resolution presets: output resolution -> input dimensions for 4x upscaling
+# All dimensions must be divisible by 8 for RAFT optical flow
+RESOLUTION_PRESETS = {
+    720: {'input_height': 176, 'input_width': 320},    # 720p output (1280x704) - 176*4=704, 320*4=1280
+    1080: {'input_height': 272, 'input_width': 480},   # 1080p output (1920x1088) - 272*4=1088, 480*4=1920
+    1440: {'input_height': 360, 'input_width': 640},   # 1440p output (2560x1440) - 360*4=1440, 640*4=2560
+}
 
 
 def get_device_config(device):
@@ -38,7 +31,7 @@ def get_device_config(device):
     Return device-specific configuration settings.
     """
     config = {
-        'dtype': torch.float32,  # MPS works best with float32
+        'dtype': torch.float32,
         'enable_attention_slicing': False,
         'enable_vae_slicing': False,
         'enable_xformers': False,
@@ -47,11 +40,10 @@ def get_device_config(device):
     if device.type == 'cuda':
         config['dtype'] = torch.float16
         config['enable_xformers'] = True
-        # Enable TF32 for faster computation on Ampere+ GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
     elif device.type == 'mps':
-        config['dtype'] = torch.float32  # MPS doesn't fully support float16
-        config['enable_attention_slicing'] = True  # Reduces memory on MPS
+        config['dtype'] = torch.float32
+        config['enable_attention_slicing'] = True
         config['enable_vae_slicing'] = True
 
     return config
@@ -68,19 +60,133 @@ def clear_memory(device):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test code for Stream-DiffVSR.")
-    parser.add_argument("--model_id", default='Jamichsu/Stream-DiffVSR', type=str, help="model_id of the model to be tested.")
+    parser = argparse.ArgumentParser(description="Stream-DiffVSR: Video Super-Resolution")
+    parser.add_argument("--input", type=str, required=True, help="Input video file (mp4, mov, avi, etc.)")
+    parser.add_argument("--output_path", type=str, default='./output/', help="Output directory for upscaled video.")
+    parser.add_argument("--model_id", default='Jamichsu/Stream-DiffVSR', type=str, help="Model ID from HuggingFace.")
     parser.add_argument("--unet_pretrained_weight", type=str, help="UNet pretrained weight.")
     parser.add_argument("--controlnet_pretrained_weight", type=str, help="ControlNet pretrained weight.")
     parser.add_argument("--temporal_vae_pretrained_weight", type=str, help="Path to Temporal VAE.")
-    parser.add_argument("--out_path", default='./StreamDiffVSR_results/', type=str, help="Path to output folder.")
-    parser.add_argument("--in_path", type=str, required=True, help="Path to input folder (containing sets of LR images).")
     parser.add_argument("--num_inference_steps", type=int, default=4, help="Number of sampling steps")
-    parser.add_argument("--enable_tensorrt", action='store_true', help="Enable TensorRT. Note that the performance will drop if TensorRT is enabled. (CUDA only)")
-    parser.add_argument("--image_height", type=int, default=720, help="Height of the output images. Needed for TensorRT.")
-    parser.add_argument("--image_width", type=int, default=1280, help="Width of the output images. Needed for TensorRT.")
-    parser.add_argument("--device", type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], help="Device to use for inference.")
+    parser.add_argument("--device", type=str, default='mps', choices=['mps', 'cuda'], help="Device to use for inference.")
+    
+    # MPS-specific options
+    parser.add_argument("--resolution", type=int, default=720, choices=[720, 1080, 1440],
+                        help="Output resolution preset (720p, 1080p, 1440p). MPS only.")
+    
+    # TensorRT-specific options (CUDA only)
+    parser.add_argument("--enable_tensorrt", action='store_true', help="Enable TensorRT acceleration. CUDA only.")
+    parser.add_argument("--image_height", type=int, default=720, help="Output height for TensorRT. Requires --enable_tensorrt.")
+    parser.add_argument("--image_width", type=int, default=1280, help="Output width for TensorRT. Requires --enable_tensorrt.")
+    
     return parser.parse_args()
+
+
+def validate_args(args):
+    """Validate argument combinations and fail fast on invalid configs."""
+    
+    # Check if ffmpeg is installed
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.exit("Error: ffmpeg is not installed. Install it with: brew install ffmpeg")
+    
+    # Validate input file exists
+    if not os.path.isfile(args.input):
+        sys.exit(f"Error: Input file not found: {args.input}")
+    
+    # Validate input file is a video
+    valid_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+    if not args.input.lower().endswith(valid_extensions):
+        sys.exit(f"Error: Input must be a video file. Supported formats: {', '.join(valid_extensions)}")
+    
+    # --resolution is MPS only
+    if args.device == 'cuda' and args.resolution != 720:
+        sys.exit("Error: --resolution is only supported with --device mps. For CUDA, use --enable_tensorrt with --image_height and --image_width.")
+    
+    # --enable_tensorrt is CUDA only
+    if args.enable_tensorrt and args.device != 'cuda':
+        sys.exit("Error: --enable_tensorrt requires --device cuda.")
+    
+    # --image_height and --image_width require --enable_tensorrt
+    # Check if user explicitly provided these args (not using defaults)
+    if not args.enable_tensorrt:
+        # Check if user explicitly set these (they differ from defaults)
+        if args.image_height != 720 or args.image_width != 1280:
+            sys.exit("Error: --image_height and --image_width require --enable_tensorrt.")
+
+
+def extract_frames_from_video(video_path, output_dir):
+    """
+    Extract frames from video using ffmpeg.
+    Returns the frame rate and number of frames extracted.
+    """
+    print(f"Extracting frames from video: {video_path}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get video FPS
+    fps_cmd = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=r_frame_rate', '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_path
+    ]
+    
+    try:
+        fps_result = subprocess.run(fps_cmd, capture_output=True, text=True, check=True)
+        fps_str = fps_result.stdout.strip()
+        if '/' in fps_str:
+            num, denom = map(float, fps_str.split('/'))
+            fps = num / denom
+        else:
+            fps = float(fps_str)
+    except subprocess.CalledProcessError:
+        print("Warning: Could not detect FPS, defaulting to 30")
+        fps = 30.0
+    
+    # Extract frames
+    frame_pattern = os.path.join(output_dir, 'frame_%05d.png')
+    extract_cmd = [
+        'ffmpeg', '-i', video_path,
+        '-qscale:v', '2',
+        frame_pattern,
+        '-y'
+    ]
+    
+    try:
+        subprocess.run(extract_cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Error: Failed to extract frames from video. ffmpeg error: {e.stderr.decode()}")
+    
+    # Count frames
+    frame_count = len([f for f in os.listdir(output_dir) if f.endswith('.png')])
+    print(f"Extracted {frame_count} frames at {fps:.2f} FPS")
+    
+    return fps, frame_count
+
+
+def encode_frames_to_video(frames_dir, output_path, fps):
+    """
+    Encode frames back to video using ffmpeg with original framerate.
+    """
+    print(f"\nEncoding {len(os.listdir(frames_dir))} frames to video at {fps:.2f} FPS...")
+    frame_pattern = os.path.join(frames_dir, 'frame_%05d.png')
+    
+    encode_cmd = [
+        'ffmpeg', '-y',
+        '-framerate', str(fps),
+        '-i', frame_pattern,
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+    
+    try:
+        result = subprocess.run(encode_cmd, capture_output=True, check=True)
+        print(f"✓ Video saved to: {output_path}")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Error: Failed to encode video. ffmpeg error: {e.stderr.decode()}")
 
 
 def load_component(cls, weight_path, model_id, subfolder):
@@ -91,130 +197,161 @@ def load_component(cls, weight_path, model_id, subfolder):
 
 def main():
     args = parse_args()
+    validate_args(args)
 
-    print("Run with arguments:")
-    for arg, value in vars(args).items():
-        print(f"  {arg}: {value}")
+    device = torch.device(args.device)
+    device_config = get_device_config(device)
+    
+    # Get input dimensions based on resolution preset (MPS) or TensorRT config (CUDA)
+    if args.device == 'mps':
+        preset = RESOLUTION_PRESETS[args.resolution]
+        input_height = preset['input_height']
+        input_width = preset['input_width']
+        output_height = input_height * 4
+        output_width = input_width * 4
+    else:
+        # CUDA path - dimensions come from TensorRT args if enabled
+        input_height = None
+        input_width = None
+        if args.enable_tensorrt:
+            output_height = args.image_height
+            output_width = args.image_width
+        else:
+            output_height = None
+            output_width = None
+
+    print("="*60)
+    print("Stream-DiffVSR: Video Super-Resolution")
+    print("="*60)
+    print(f"Input video: {args.input}")
+    print(f"Output path: {args.output_path}")
+    print(f"Device: {device}")
+    print(f"Device config: {device_config}")
+    if args.device == 'mps':
+        print(f"Resolution: {args.resolution}p (input: {input_width}x{input_height} -> output: {output_width}x{output_height})")
+    print("="*60)
 
     set_seed(42)
+    
+    # Setup temporary directory for frames
+    video_name = Path(args.input).stem
+    temp_dir = Path('pipeline/tmp')
+    frames_input_dir = temp_dir / video_name / 'input'
+    frames_output_dir = temp_dir / video_name / 'output'
+    
+    try:
+        # Extract frames from video
+        fps, frame_count = extract_frames_from_video(args.input, str(frames_input_dir))
 
-    # Device selection
-    if args.device == 'auto':
-        device = get_device()
-    else:
-        device = torch.device(args.device)
+        # Load models
+        print("\nLoading models...")
+        controlnet = load_component(ControlNetModel, args.controlnet_pretrained_weight, args.model_id, "controlnet")
+        unet = load_component(UNet2DConditionModel, args.unet_pretrained_weight, args.model_id, "unet")
+        vae = load_component(TemporalAutoencoderTiny, args.temporal_vae_pretrained_weight, args.model_id, "vae")
+        scheduler = DDIMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
 
-    device_config = get_device_config(device)
-    print(f"\nUsing device: {device}")
-    print(f"Device config: {device_config}")
+        tensorrt_kwargs = {
+            "custom_pipeline": "/acceleration/tensorrt/sd_with_controlnet_ST",
+            "image_height": args.image_height,
+            "image_width": args.image_width,
+        } if args.enable_tensorrt else {"custom_pipeline": None}
 
-    # TensorRT only works with CUDA
-    if args.enable_tensorrt and device.type != 'cuda':
-        print("Warning: TensorRT is only available on CUDA devices. Disabling TensorRT.")
-        args.enable_tensorrt = False
-
-    controlnet = load_component(ControlNetModel, args.controlnet_pretrained_weight, args.model_id, "controlnet")
-    unet = load_component(UNet2DConditionModel, args.unet_pretrained_weight, args.model_id, "unet")
-    vae = load_component(TemporalAutoencoderTiny, args.temporal_vae_pretrained_weight, args.model_id, "vae")
-    scheduler = DDIMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
-
-    tensorrt_kwargs = {
-        "custom_pipeline": "/acceleration/tensorrt/sd_with_controlnet_ST",
-        "image_height": args.image_height,
-        "image_width": args.image_width,
-    } if args.enable_tensorrt else {"custom_pipeline": None}
-
-    pipeline = StreamDiffVSRPipeline.from_pretrained(
-        args.model_id,
-        controlnet=controlnet,
-        vae=vae,
-        unet=unet,
-        scheduler=scheduler,
-        **tensorrt_kwargs
-    )
-
-    if args.enable_tensorrt:
-        pipeline.set_cached_folder("Jamichsu/Stream-DiffVSR")
-
-    pipeline = pipeline.to(device)
-
-    # Apply device-specific optimizations
-    if device_config['enable_xformers']:
-        try:
-            pipeline.enable_xformers_memory_efficient_attention()
-            print("xFormers memory efficient attention enabled")
-        except Exception as e:
-            print(f"xFormers not available: {e}")
-
-    if device_config['enable_attention_slicing']:
-        pipeline.enable_attention_slicing("auto")
-        print("Attention slicing enabled")
-
-    if device_config['enable_vae_slicing']:
-        pipeline.enable_vae_slicing()
-        print("VAE slicing enabled")
-
-    of_model = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
-    of_model.requires_grad_(False)
-
-    seqs = sorted(os.listdir(args.in_path))
-    total_frames = 0
-    total_time = 0
-
-    for seq in seqs:
-        seq_path = os.path.join(args.in_path, seq)
-        if not os.path.isdir(seq_path):
-            continue
-
-        frame_names = sorted(os.listdir(seq_path))
-        frames = []
-        for frame_name in frame_names:
-            frame_path = os.path.join(seq_path, frame_name)
-            if frame_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                with Image.open(frame_path) as im:
-                    frames.append(im.convert("RGB").copy())
-
-        if not frames:
-            print(f"No valid frames found in {seq_path}, skipping...")
-            continue
-
-        print(f"\nProcessing {seq} ({len(frames)} frames)...")
-        start_time = time.time()
-
-        output = pipeline(
-            '', frames,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=0,
-            of_model=of_model
+        pipeline = StreamDiffVSRPipeline.from_pretrained(
+            args.model_id,
+            controlnet=controlnet,
+            vae=vae,
+            unet=unet,
+            scheduler=scheduler,
+            **tensorrt_kwargs
         )
 
+        if args.enable_tensorrt:
+            pipeline.set_cached_folder("Jamichsu/Stream-DiffVSR")
+
+        pipeline = pipeline.to(device)
+
+        # Apply device-specific optimizations
+        if device_config['enable_xformers']:
+            try:
+                pipeline.enable_xformers_memory_efficient_attention()
+                print("xFormers enabled")
+            except Exception as e:
+                print(f"xFormers not available: {e}")
+
+        if device_config['enable_attention_slicing']:
+            pipeline.enable_attention_slicing("auto")
+            print("Attention slicing enabled")
+
+        if device_config['enable_vae_slicing']:
+            pipeline.enable_vae_slicing()
+            print("VAE slicing enabled")
+
+        of_model = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
+        of_model.requires_grad_(False)
+
+        # Load frames
+        print(f"\nLoading {frame_count} frames...")
+        frame_names = sorted([f for f in os.listdir(frames_input_dir) if f.endswith('.png')])
+        frames = []
+        for frame_name in frame_names:
+            frame_path = os.path.join(frames_input_dir, frame_name)
+            with Image.open(frame_path) as im:
+                frames.append(im.convert("RGB").copy())
+
+        print(f"Processing {len(frames)} frames...")
+        print(f"  Original frame size: {frames[0].size[0]}x{frames[0].size[1]}")
+        if args.device == 'mps':
+            print(f"  Will process as: {input_width}x{input_height} -> output: {output_width}x{output_height}")
+        
+        start_time = time.time()
+
+        # Pass height/width to pipeline so it preprocesses correctly
+        pipeline_kwargs = {
+            'num_inference_steps': args.num_inference_steps,
+            'guidance_scale': 0,
+            'of_model': of_model
+        }
+        if args.device == 'mps':
+            pipeline_kwargs['height'] = input_height
+            pipeline_kwargs['width'] = input_width
+
+        output = pipeline('', frames, **pipeline_kwargs)
+
         elapsed = time.time() - start_time
-        total_frames += len(frames)
-        total_time += elapsed
 
         frames_hr = output.images
         frames_to_save = [frame[0] for frame in frames_hr]
 
-        seq_path_obj = Path(seq_path)
-        target_path = os.path.join(args.out_path, seq_path_obj.parent.name, seq_path_obj.name)
-        os.makedirs(target_path, exist_ok=True)
+        avg_fps = len(frames) / elapsed
+        print(f"\nProcessing complete!")
+        print(f"  Time: {elapsed:.2f}s | {avg_fps:.2f} FPS | {elapsed/len(frames):.3f}s per frame")
 
-        for frame, name in zip(frames_to_save, frame_names):
-            frame.save(os.path.join(target_path, name))
+        # Save upscaled frames temporarily for ffmpeg
+        os.makedirs(frames_output_dir, exist_ok=True)
+        print(f"\nSaving {len(frames_to_save)} upscaled frames for encoding...")
+        for i, frame in enumerate(frames_to_save):
+            output_name = f"frame_{i+1:05d}.png"
+            frame.save(os.path.join(frames_output_dir, output_name))
 
-        fps = len(frames) / elapsed
-        print(f"Upscaled {seq} and saved to {target_path}.")
-        print(f"  Time: {elapsed:.2f}s | FPS: {fps:.2f} | Per frame: {elapsed/len(frames):.3f}s")
+        # Encode to video with original framerate
+        os.makedirs(args.output_path, exist_ok=True)
+        output_video = os.path.join(args.output_path, f"{video_name}_upscaled.mp4")
+        encode_frames_to_video(str(frames_output_dir), output_video, fps)
+
+        print(f"\n{'='*60}")
+        print(f"Complete! Output saved to: {output_video}")
+        print(f"{'='*60}")
 
         del frames
         del frames_to_save
         clear_memory(device)
-
-    if total_frames > 0:
-        print(f"\n{'='*50}")
-        print(f"Total: {total_frames} frames in {total_time:.2f}s")
-        print(f"Average: {total_frames/total_time:.2f} FPS | {total_time/total_frames:.3f}s per frame")
-        print(f"{'='*50}")
+        
+    finally:
+        # Cleanup temporary directory
+        if temp_dir.exists():
+            print("\nCleaning up temporary files...")
+            shutil.rmtree(temp_dir)
+            print("Cleanup complete.")
 
 
 if __name__ == "__main__":
