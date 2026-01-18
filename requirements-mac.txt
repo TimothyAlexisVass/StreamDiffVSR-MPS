@@ -19,6 +19,7 @@ pillow>=10.4.0
 opencv-python>=4.10.0.84
 imageio>=2.36.1
 scikit-image>=0.24.0
+matplotlib>=3.10.8
 
 # Numerical Computing
 numpy>=1.26.4

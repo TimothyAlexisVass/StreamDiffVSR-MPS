@@ -1,0 +1,16 @@
+# Data directories (keep dirs, ignore contents)
+/input/*
+!/input/.gitkeep
+/output/*
+!/output/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Test files
+*.mp4

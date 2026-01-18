@@ -171,7 +171,8 @@ def main():
         for frame_name in frame_names:
             frame_path = os.path.join(seq_path, frame_name)
             if frame_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                frames.append(Image.open(frame_path))
+                with Image.open(frame_path) as im:
+                    frames.append(im.convert("RGB").copy())
 
         if not frames:
             print(f"No valid frames found in {seq_path}, skipping...")
