@@ -4,11 +4,15 @@ import argparse
 import time
 import subprocess
 import shutil
+import warnings
 from pathlib import Path
 import torch
 from accelerate.utils import set_seed
 from PIL import Image
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+
+# Suppress safety checker warning
+warnings.filterwarnings('ignore', message='.*safety checker.*')
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
@@ -198,6 +202,10 @@ def load_component(cls, weight_path, model_id, subfolder):
 def main():
     args = parse_args()
     validate_args(args)
+
+    # Suppress CUDA availability warning on MPS
+    if args.device == 'mps':
+        warnings.filterwarnings('ignore', message='.*CUDA is not available.*')
 
     device = torch.device(args.device)
     device_config = get_device_config(device)
