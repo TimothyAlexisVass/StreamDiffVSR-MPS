@@ -955,7 +955,19 @@ class StreamDiffVSRPipeline(
             controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
 
         # 8. Denoising loop
-        forward_flows = self.compute_flows(of_model, upscaled_images, rescale_factor=of_rescale_factor)
+        # Compute optical flow on LR images (pre-upscale) to avoid OOM, then scale the flow
+        # The flow needs to be: 1) spatially upscaled by 4x, 2) values multiplied by 4x
+        forward_flows_lr = self.compute_flows(of_model, images, rescale_factor=of_rescale_factor)
+        forward_flows = []
+        for flow_lr in forward_flows_lr:
+            # flow_lr shape: (B, H, W, 2) - upscale spatially and multiply values by 4
+            flow_hr = F.interpolate(
+                flow_lr.permute(0, 3, 1, 2),  # (B, 2, H, W)
+                scale_factor=4,
+                mode='bilinear',
+                align_corners=False
+            ).permute(0, 2, 3, 1) * 4  # (B, H*4, W*4, 2), values scaled by 4
+            forward_flows.append(flow_hr)
         flows = forward_flows
         interp_mode = 'bilinear' if of_rescale_factor == 1 else 'nearest'
 
