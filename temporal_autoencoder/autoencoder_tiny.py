@@ -311,7 +311,7 @@ class TemporalAutoencoderTiny(ModelMixin, ConfigMixin):
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True, return_layers_features: bool = True, return_features_only: bool = False) -> Union[TemporalAutoencoderTinyOutput, Tuple[torch.Tensor]]:
-        layer_features = [] if return_layers_features else None  # 只有啟用時才存儲特徵
+        layer_features = [] if return_layers_features else None  # Only store features when enabled
 
         if self.use_slicing and x.shape[0] > 1:
             output = [

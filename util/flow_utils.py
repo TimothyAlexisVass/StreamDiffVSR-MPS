@@ -121,12 +121,12 @@ def save_single_occlusion_mask(occlusion_tensor, save_path='occlusion_mask.png')
     mask = occlusion_tensor[0].detach().cpu().numpy()  # shape: [H, W]
     H, W = mask.shape
 
-    # 設定 figure 大小為實際像素大小（以 DPI 來計算）
+    # Set figure size to actual pixel size (calculated by DPI)
     dpi = 100
     figsize = (W / dpi, H / dpi)
 
     fig = plt.figure(figsize=figsize, dpi=dpi)
-    ax = plt.Axes(fig, [0., 0., 1., 1.])  # 填滿整個畫布，不留邊
+    ax = plt.Axes(fig, [0., 0., 1., 1.])  # Fill the entire canvas without margins
     ax.set_axis_off()
     fig.add_axes(ax)
 

@@ -598,7 +598,7 @@ class TemporalAutoencoderTinyBlock(nn.Module):
         if self.prev_features is not None:
             B, C, H, W = current_features.shape
             
-            # 根據特徵圖尺寸選擇固定的 Pooling 尺寸和 Kernel Size
+            # Select fixed Pooling size and Kernel Size based on feature map dimensions
             # if (H, W) == (720, 1280):
             #     pool_kernel = (4, 4)
             # elif (H, W) == (360, 640):
@@ -611,7 +611,7 @@ class TemporalAutoencoderTinyBlock(nn.Module):
             #     raise ValueError(f"Unsupported input size: {H}x{W}")
             pool_kernel = (4, 4)
 
-            # 使用固定的 AvgPool2d
+            # Use fixed AvgPool2d
             avg_pool = nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_kernel)
             current_pooled = avg_pool(current_features)
             prev_pooled = avg_pool(self.prev_features)
