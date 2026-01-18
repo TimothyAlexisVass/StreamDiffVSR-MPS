@@ -13,6 +13,9 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # Suppress safety checker warning
 warnings.filterwarnings('ignore', message='.*safety checker.*')
+# Suppress CUDA availability warning
+warnings.filterwarnings('ignore', message='.*CUDA is not available.*')
+warnings.filterwarnings('ignore', message='.*device_type of.*cuda.*')
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
@@ -64,18 +67,26 @@ def clear_memory(device):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stream-DiffVSR: Video Super-Resolution")
+    # Use a formatter with wider width for better help text alignment
+    class CustomHelpFormatter(argparse.HelpFormatter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, width=120, max_help_position=50, **kwargs)
+    
+    parser = argparse.ArgumentParser(
+        description="Stream-DiffVSR: Video Super-Resolution",
+        formatter_class=CustomHelpFormatter
+    )
     parser.add_argument("--input", type=str, required=True, help="Input video file (mp4, mov, avi, etc.)")
     parser.add_argument("--output_path", type=str, default='./output/', help="Output directory for upscaled video.")
     parser.add_argument("--model_id", default='Jamichsu/Stream-DiffVSR', type=str, help="Model ID from HuggingFace.")
-    parser.add_argument("--unet_pretrained_weight", type=str, help="UNet pretrained weight.")
-    parser.add_argument("--controlnet_pretrained_weight", type=str, help="ControlNet pretrained weight.")
-    parser.add_argument("--temporal_vae_pretrained_weight", type=str, help="Path to Temporal VAE.")
+    parser.add_argument("--unet", type=str, help="UNet pretrained weight.")
+    parser.add_argument("--controlnet", type=str, help="ControlNet pretrained weight.")
+    parser.add_argument("--temporal_vae", type=str, help="Path to Temporal VAE.")
     parser.add_argument("--num_inference_steps", type=int, default=4, help="Number of sampling steps")
     parser.add_argument("--device", type=str, default='mps', choices=['mps', 'cuda'], help="Device to use for inference.")
     
     # MPS-specific options
-    parser.add_argument("--resolution", type=int, default=720, choices=[720, 1080, 1440],
+    parser.add_argument("--output_resolution", type=int, default=720, choices=[720, 1080, 1440],
                         help="Output resolution preset (720p, 1080p, 1440p). MPS only.")
     
     # TensorRT-specific options (CUDA only)
@@ -104,9 +115,9 @@ def validate_args(args):
     if not args.input.lower().endswith(valid_extensions):
         sys.exit(f"Error: Input must be a video file. Supported formats: {', '.join(valid_extensions)}")
     
-    # --resolution is MPS only
-    if args.device == 'cuda' and args.resolution != 720:
-        sys.exit("Error: --resolution is only supported with --device mps. For CUDA, use --enable_tensorrt with --image_height and --image_width.")
+    # --output_resolution is MPS only
+    if args.device == 'cuda' and args.output_resolution != 720:
+        sys.exit("Error: --output_resolution is only supported with --device mps. For CUDA, use --enable_tensorrt with --image_height and --image_width.")
     
     # --enable_tensorrt is CUDA only
     if args.enable_tensorrt and args.device != 'cuda':
@@ -212,7 +223,7 @@ def main():
     
     # Get input dimensions based on resolution preset (MPS) or TensorRT config (CUDA)
     if args.device == 'mps':
-        preset = RESOLUTION_PRESETS[args.resolution]
+        preset = RESOLUTION_PRESETS[args.output_resolution]
         input_height = preset['input_height']
         input_width = preset['input_width']
         output_height = input_height * 4
@@ -236,7 +247,7 @@ def main():
     print(f"Device: {device}")
     print(f"Device config: {device_config}")
     if args.device == 'mps':
-        print(f"Resolution: {args.resolution}p (input: {input_width}x{input_height} -> output: {output_width}x{output_height})")
+        print(f"Resolution: {args.output_resolution}p (input: {input_width}x{input_height} -> output: {output_width}x{output_height})")
     print("="*60)
 
     set_seed(42)
@@ -253,9 +264,9 @@ def main():
 
         # Load models
         print("\nLoading models...")
-        controlnet = load_component(ControlNetModel, args.controlnet_pretrained_weight, args.model_id, "controlnet")
-        unet = load_component(UNet2DConditionModel, args.unet_pretrained_weight, args.model_id, "unet")
-        vae = load_component(TemporalAutoencoderTiny, args.temporal_vae_pretrained_weight, args.model_id, "vae")
+        controlnet = load_component(ControlNetModel, args.controlnet, args.model_id, "controlnet")
+        unet = load_component(UNet2DConditionModel, args.unet, args.model_id, "unet")
+        vae = load_component(TemporalAutoencoderTiny, args.temporal_vae, args.model_id, "vae")
         scheduler = DDIMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
 
         tensorrt_kwargs = {
