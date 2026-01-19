@@ -80,12 +80,6 @@ python inference.py --input path/to/video.mp4 --device mps
 python inference.py --input path/to/video.mp4 --device cuda
 ```
 
-The script automatically:
-- Detects the best device (MPS on Mac, CUDA on NVIDIA)
-- Processes one frame at a time (memory efficient)
-- Uses full-resolution optical flow for temporal consistency
-- Extracts frames from video files automatically
-
 ### All Options
 
 ```bash
